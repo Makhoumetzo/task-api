@@ -1,0 +1,168 @@
+---
+- name: Déploiement Task Manager API sur Pop!_OS
+  hosts: vm_popos
+  become: yes
+
+  vars:
+    docker_image: makhoumetzo/task-api:latest
+    container_name: task-api-container
+    app_port: 8085
+    mysql_database: taskmanager_db
+    mysql_user: taskapp
+    mysql_password: taskpass123
+
+  tasks:
+
+    # ============================================================
+    # ÉTAPE 1 : Mise à jour du système
+    # ============================================================
+
+    - name: Mettre à jour le cache APT
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    # ============================================================
+    # ÉTAPE 2 : Installation de Docker
+    # ============================================================
+
+    - name: Vérifier si Docker est installé
+      command: docker --version
+      register: docker_installed
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Installer les prérequis Docker
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+      when: docker_installed.failed
+
+    - name: Ajouter la clé GPG Docker
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      when: docker_installed.failed
+
+    - name: Ajouter le repository Docker
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+      when: docker_installed.failed
+
+    - name: Installer Docker CE
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+      when: docker_installed.failed
+
+    - name: Démarrer et activer Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    # ============================================================
+    # ÉTAPE 3 : Installation et configuration de MySQL
+    # ============================================================
+
+    - name: Installer MySQL Server
+      apt:
+        name: mysql-server
+        state: present
+
+    - name: Démarrer et activer MySQL
+      systemd:
+        name: mysql
+        state: started
+        enabled: yes
+
+    - name: Installer le module Python MySQL (pour Ansible)
+      apt:
+        name: python3-pymysql
+        state: present
+
+    - name: Créer la base de données taskmanager_db
+      mysql_db:
+        name: "{{ mysql_database }}"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Créer l'utilisateur MySQL taskapp
+      mysql_user:
+        name: "{{ mysql_user }}"
+        password: "{{ mysql_password }}"
+        priv: "{{ mysql_database }}.*:ALL"
+        host: "%"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    # ============================================================
+    # ÉTAPE 4 : Déploiement du conteneur Docker
+    # ============================================================
+
+    - name: Pull l'image Docker depuis Docker Hub
+      docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+        force_source: yes
+
+    - name: Stopper l'ancien conteneur (si existant)
+      docker_container:
+        name: "{{ container_name }}"
+        state: stopped
+      ignore_errors: yes
+
+    - name: Supprimer l'ancien conteneur
+      docker_container:
+        name: "{{ container_name }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Lancer le nouveau conteneur task-api
+      docker_container:
+        name: "{{ container_name }}"
+        image: "{{ docker_image }}"
+        state: started
+        restart_policy: always
+        ports:
+          - "{{ app_port }}:{{ app_port }}"
+        env:
+          SPRING_DATASOURCE_URL: "jdbc:mysql://host.docker.internal:3306/{{ mysql_database }}?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC"
+          SPRING_DATASOURCE_USERNAME: "{{ mysql_user }}"
+          SPRING_DATASOURCE_PASSWORD: "{{ mysql_password }}"
+          SERVER_PORT: "{{ app_port }}"
+
+    # ============================================================
+    # ÉTAPE 5 : Vérification du déploiement
+    # ============================================================
+
+    - name: Attendre que l'application démarre (port {{ app_port }})
+      wait_for:
+        port: "{{ app_port }}"
+        delay: 15
+        timeout: 90
+
+    - name: Vérifier que l'API répond
+      uri:
+        url: "http://localhost:{{ app_port }}/api/tasks"
+        method: GET
+        status_code: 200
+      register: api_check
+      retries: 5
+      delay: 5
+      until: api_check.status == 200
+
+    - name: Afficher le résultat
+      debug:
+        msg: "✅ L'API task-api est déployée et accessible sur le port {{ app_port }} !"
+      when: api_check.status == 200
